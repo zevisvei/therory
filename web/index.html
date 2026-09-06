@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d1117">
+<meta name="description" content="תרגול נהיגה נכונה: רמזורים, זכות קדימה, זיהוי סיכונים, תמרורים ומבחן תיאוריה מלא.">
+<title>מסלול · תרגול נהיגה</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%230d1117'/><circle cx='16' cy='8' r='4' fill='%23ef4444'/><circle cx='16' cy='16' r='4' fill='%23f59e0b'/><circle cx='16' cy='24' r='4' fill='%2322c55e'/></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;700;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./assets/css/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <button class="brand" id="homeBtn" type="button">
+    <span class="brand-light" aria-hidden="true"><i></i><i></i><i></i></span>
+    <span class="brand-text">מסלול</span>
+  </button>
+
+  <div class="profile-chip" id="profileChip">
+    <div class="lvl-ring" id="lvlRing"><span id="lvlNum">1</span></div>
+    <div class="profile-meta">
+      <strong id="profileName">נהג/ת חדש/ה</strong>
+      <span id="profileXp">0 XP</span>
+    </div>
+    <div class="streak" id="streakBox" title="רצף ימי תרגול"><span>🔥</span><b id="streakNum">0</b></div>
+  </div>
+</header>
+
+<main id="screen" class="screen" tabindex="-1"></main>
+
+<div id="toaster" class="toaster" aria-live="polite"></div>
+
+<script type="module" src="./assets/js/app.js"></script>
+</body>
+</html>

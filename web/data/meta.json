@@ -1,0 +1,21 @@
+{
+  "total": 1802,
+  "byCategory": {
+    "laws": 901,
+    "signs": 391,
+    "safety": 400,
+    "vehicle": 110
+  },
+  "withImages": {
+    "laws": 113,
+    "signs": 378,
+    "safety": 103,
+    "vehicle": 2
+  },
+  "categoryNames": {
+    "laws": "חוקי התנועה",
+    "safety": "בטיחות",
+    "signs": "תמרורים",
+    "vehicle": "הכרת הרכב"
+  }
+}
