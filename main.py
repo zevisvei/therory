@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import os
 import random
+import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -12,6 +14,29 @@ from question_bank import Question, list_categories, list_question_types
 from questions_db import QuestionsDatabase
 
 TZ = ZoneInfo("Asia/Jerusalem")
+
+FROZEN = getattr(sys, "frozen", False)
+
+
+def resource_dir() -> Path:
+    """Directory holding read-only bundled files (questions.db, scripts)."""
+    if FROZEN:
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).parent
+
+
+def user_data_dir() -> Path:
+    """Writable directory for the user's own data.
+
+    When frozen, _MEIPASS is a temp dir that PyInstaller wipes on exit, so the
+    quiz history has to live somewhere that survives the run.
+    """
+    if not FROZEN:
+        return Path(__file__).parent
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    target = (Path(base) if base else Path.home() / ".local" / "share") / "TheoryQuiz"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
 
 
 class TheoryQuizApp:
@@ -1533,9 +1558,8 @@ class TheoryQuizApp:
 
 
 def main(page: ft.Page) -> None:
-    base_dir = Path(__file__).parent
-    db_path = base_dir / "theory_quiz.db"
-    questions_db_path = base_dir / "questions.db"
+    db_path = user_data_dir() / "theory_quiz.db"
+    questions_db_path = resource_dir() / "questions.db"
 
     # Initialize Questions DB
     questions_db = QuestionsDatabase(questions_db_path)
