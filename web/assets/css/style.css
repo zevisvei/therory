@@ -381,7 +381,7 @@ p { margin: 0; }
 .canvas-overlay h2 { font-size: clamp(1.3rem, 5vw, 1.9rem); margin-bottom: 8px; }
 
 /* ------------------------------------------------------- simulator HUD */
-.sim-layout { display: grid; grid-template-columns: 1fr 290px; gap: 14px; align-items: start; }
+.sim-layout { display: grid; grid-template-columns: 1fr 260px; gap: 14px; align-items: start; }
 @media (max-width: 900px) { .sim-layout { grid-template-columns: 1fr; } }
 
 .sim-gauges {
@@ -423,14 +423,52 @@ p { margin: 0; }
 .fault.critical { border-inline-start-color: var(--red); background: var(--bad-bg); }
 .fault .f-time { color: var(--text-mute); font-variant-numeric: tabular-nums; flex: 0 0 auto; }
 
-.touch-pad { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-top: 12px; }
-.touch-pad button {
-  padding: 16px 4px; border-radius: var(--r);
-  background: var(--surface-2); border: 1px solid var(--line);
-  font-size: 1.2rem; font-weight: 900; user-select: none; touch-action: manipulation;
+/* Always visible, on desktop too: the key caption is what teaches the mapping,
+   and pressing a key lights the matching button. */
+/* Physical layout, not reading order: the steer-left button has to sit on the
+   left of the bar even though the page is RTL, or the mapping fights the hand. */
+.control-bar {
+  direction: ltr;
+  display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-top: 12px;
 }
-.touch-pad button.active { background: var(--blue); border-color: var(--blue); }
-@media (hover: hover) and (pointer: fine) { .touch-pad { display: none; } }
+.control-bar .ctrl { direction: rtl; }
+@media (max-width: 620px) { .control-bar { grid-template-columns: repeat(3, 1fr); } }
+
+.ctrl {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 11px 6px;
+  border-radius: var(--r);
+  background: var(--surface-2);
+  border: 1.5px solid var(--line);
+  user-select: none; touch-action: manipulation;
+  transition: background .09s, border-color .09s, transform .07s, color .09s;
+}
+.ctrl .c-glyph { font-size: 1.4rem; line-height: 1; }
+.ctrl .c-label { font-size: .78rem; font-weight: 700; text-align: center; line-height: 1.2; }
+.ctrl .c-key {
+  font-size: .66rem; color: var(--text-mute);
+  border: 1px solid var(--line); border-radius: 5px; padding: 0 6px;
+}
+.ctrl.active { transform: translateY(1px); }
+.ctrl.active .c-key { color: inherit; border-color: currentColor; opacity: .8; }
+.ctrl[data-role="gas"].active    { background: var(--green); border-color: #86efac; color: #05210f; }
+.ctrl[data-role="brake"].active  { background: var(--red);   border-color: #fca5a5; color: #fff; }
+.ctrl[data-role="steer"].active  { background: var(--blue);  border-color: #93c5fd; color: #fff; }
+.ctrl[data-role="signal"].active { background: var(--amber); border-color: #fcd34d; color: #2b1600; }
+
+.control-legend {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px; margin-top: 16px; text-align: start;
+}
+.control-legend div {
+  background: rgba(255, 255, 255, .05); border: 1px solid var(--line);
+  border-radius: var(--r-sm); padding: 8px 10px; font-size: .8rem;
+}
+kbd {
+  display: inline-block; background: var(--surface-2);
+  border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px;
+  padding: 1px 7px; font-family: inherit; font-size: .78rem; margin-inline-end: 6px;
+}
 
 /* --------------------------------------------------------- chips & tags */
 .chips { display: flex; gap: 8px; flex-wrap: wrap; }

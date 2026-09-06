@@ -10,18 +10,19 @@
  * World units: 1 unit = 10 cm, so km/h = speed * 0.36.
  */
 
-import { el, clear, pick, shuffle, clamp, fitCanvas, loop, resultScreen, levelPicker, chipGroup, toast } from '../ui.js';
+import { el, clear, pick, shuffle, randInt, clamp, fitCanvas, loop, resultScreen, levelPicker, chipGroup, toast } from '../ui.js';
 import { Store } from '../store.js';
 
 const VIEW_W = 880;
 const VIEW_H = 520;
-const ZOOM = 0.78;
+const BASE_ZOOM = 1.02;
 
 const BLOCK = 460;
 const ROAD_W = 104;
 const HALF_ROAD = ROAD_W / 2;
 const LANE_OFFSET = ROAD_W / 4;
 const STUB = 150;              // length of the decorative cross streets
+const KERB = 12;
 
 const CAR_L = 44;
 const CAR_W = 22;
@@ -69,6 +70,8 @@ const DIRS = [
 ];
 
 const TURN_TEXT = { straight: 'המשך/י ישר', left: 'פנה/י שמאלה', right: 'פנה/י ימינה' };
+
+const BUILDING_COLOURS = ['#232c3c', '#26303f', '#2a3446', '#1f2837', '#2d3748'];
 
 /* ------------------------------------------------------------ route build */
 
@@ -152,7 +155,91 @@ function buildRoute(level, topics) {
     });
   }
 
-  return { nodes: nodes.map(pos), segments, junctions };
+  return { nodes: nodes.map(pos), segments, junctions, cells: nodes };
+}
+
+/**
+ * Static street furniture: city blocks, trees, lamps and strolling pedestrians.
+ * Generated once so the world is stable, and only in the blocks the route
+ * actually passes, so nothing is drawn where it will never be seen.
+ */
+function buildScenery(route) {
+  const buildings = [];
+  const trees = [];
+  const lamps = [];
+  const walkers = [];
+
+  const cols = route.cells.map((n) => n.c);
+  const rows = route.cells.map((n) => n.r);
+  const minC = Math.min(...cols) - 1;
+  const maxC = Math.max(...cols);
+  const minR = Math.min(...rows) - 1;
+  const maxR = Math.max(...rows);
+
+  for (let c = minC; c <= maxC; c++) {
+    for (let r = minR; r <= maxR; r++) {
+      const cx = c * BLOCK + BLOCK / 2;
+      const cy = r * BLOCK + BLOCK / 2;
+      const park = Math.random() < 0.22;
+
+      if (park) {
+        for (let k = 0; k < 7; k++) {
+          trees.push({
+            x: cx + (Math.random() - 0.5) * (BLOCK - 220),
+            y: cy + (Math.random() - 0.5) * (BLOCK - 220),
+            r: 16 + Math.random() * 9,
+          });
+        }
+        continue;
+      }
+
+      // Two or three separate blocks per plot reads more like a street.
+      const count = randInt(2, 3);
+      for (let k = 0; k < count; k++) {
+        const w = 90 + Math.random() * 120;
+        const h = 90 + Math.random() * 120;
+        buildings.push({
+          x: cx + (Math.random() - 0.5) * (BLOCK - ROAD_W - w - 60),
+          y: cy + (Math.random() - 0.5) * (BLOCK - ROAD_W - h - 60),
+          w, h,
+          colour: pick(BUILDING_COLOURS),
+          lit: Math.random() < 0.55,
+        });
+      }
+    }
+  }
+
+  for (const seg of route.segments) {
+    const steps = Math.max(2, Math.round(seg.length / 105));
+    for (let i = 1; i < steps; i++) {
+      const t = i / steps;
+      const x = seg.a.x + (seg.b.x - seg.a.x) * t;
+      const y = seg.a.y + (seg.b.y - seg.a.y) * t;
+      const side = i % 2 === 0 ? 1 : -1;
+      const off = HALF_ROAD + KERB + 16;
+      if (i % 2 === 0) {
+        lamps.push({ x: x + seg.right.x * off * side, y: y + seg.right.y * off * side });
+      } else {
+        trees.push({ x: x + seg.right.x * off * side, y: y + seg.right.y * off * side, r: 15 + Math.random() * 6 });
+      }
+    }
+
+    if (Math.random() < 0.8) {
+      const t = 0.25 + Math.random() * 0.5;
+      const side = Math.random() < 0.5 ? 1 : -1;
+      const off = (HALF_ROAD + KERB / 2) * side;
+      walkers.push({
+        ox: seg.a.x + (seg.b.x - seg.a.x) * t + seg.right.x * off,
+        oy: seg.a.y + (seg.b.y - seg.a.y) * t + seg.right.y * off,
+        dir: seg.dir,
+        phase: Math.random() * Math.PI * 2,
+        span: 60 + Math.random() * 90,
+        colour: pick(['#94a3b8', '#f472b6', '#38bdf8', '#facc15']),
+      });
+    }
+  }
+
+  return { buildings, trees, lamps, walkers };
 }
 
 /** Traffic-light state for the player's approach at time `t`. */
@@ -164,7 +251,94 @@ function lightState(junction, t) {
   return 'red';
 }
 
-/* ------------------------------------------------------------------ game */
+/* ------------------------------------------------------------------ audio */
+
+/**
+ * A tiny synthesised engine. Nothing is created until the player presses
+ * "start", which doubles as the gesture browsers require before audio.
+ */
+function createAudio(initiallyOn) {
+  let ac = null;
+  let master = null;
+  let engine = null;
+  let sub = null;
+  let engineGain = null;
+  let filter = null;
+  let enabled = initiallyOn;
+
+  return {
+    get enabled() { return enabled; },
+
+    setEnabled(v) {
+      enabled = v;
+      if (master) master.gain.setTargetAtTime(v ? 0.5 : 0, ac.currentTime, 0.05);
+    },
+
+    start() {
+      if (ac) return;
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      try { ac = new Ctor(); } catch { return; }
+
+      master = ac.createGain();
+      master.gain.value = enabled ? 0.5 : 0;
+      master.connect(ac.destination);
+
+      filter = ac.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 620;
+      filter.connect(master);
+
+      engineGain = ac.createGain();
+      engineGain.gain.value = 0.04;
+      engineGain.connect(filter);
+
+      engine = ac.createOscillator();
+      engine.type = 'sawtooth';
+      engine.frequency.value = 52;
+      engine.connect(engineGain);
+      engine.start();
+
+      sub = ac.createOscillator();
+      sub.type = 'triangle';
+      sub.frequency.value = 26;
+      sub.connect(engineGain);
+      sub.start();
+    },
+
+    setSpeed(speed, throttle) {
+      if (!ac || !engine) return;
+      const t = ac.currentTime;
+      const f = 46 + speed * 0.42;
+      engine.frequency.setTargetAtTime(f, t, 0.09);
+      sub.frequency.setTargetAtTime(f * 0.5, t, 0.09);
+      engineGain.gain.setTargetAtTime(0.035 + (throttle ? 0.055 : 0.012), t, 0.12);
+      filter.frequency.setTargetAtTime(480 + speed * 3.4, t, 0.12);
+    },
+
+    blip(freq, dur = 0.06, type = 'square', vol = 0.1) {
+      if (!ac || !enabled) return;
+      const o = ac.createOscillator();
+      const g = ac.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, ac.currentTime);
+      g.gain.setValueAtTime(vol, ac.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+      o.connect(g);
+      g.connect(master);
+      o.start();
+      o.stop(ac.currentTime + dur);
+    },
+
+    close() {
+      try { ac?.close(); } catch { /* already gone */ }
+      ac = null;
+      engine = null;
+    },
+  };
+}
+
+/* ------------------------------------------------------------------- game */
 
 export default {
   id: 'simulator',
@@ -199,16 +373,12 @@ export default {
           el('div', { class: 'divider' }),
           el('h3', { text: 'רמה' }),
           levels,
-          el('div', { class: 'divider' }),
-          el('div', { class: 'small muted' },
-            el('p', { text: 'מקלדת: ↑ גז · ↓ בלם · ← → היגוי · Z איתות שמאלה · X איתות ימינה' }),
-            el('p', { text: 'בנייד: לחצני המסך שמתחת ללוח.' })),
           el('button', {
-            class: 'btn btn-primary btn-lg btn-block', text: 'התחל מבחן',
+            class: 'btn btn-primary btn-lg btn-block', text: 'המשך',
             onClick: () => {
               const chosen = topics.value.length ? topics.value : ['lights'];
               const level = LEVELS.find((l) => l.id === levels.value);
-              Store.setExtra('simulator', { topics: chosen, level: level.id });
+              Store.setExtra('simulator', { ...saved, topics: chosen, level: level.id });
               play(level, chosen);
             },
           })),
@@ -219,8 +389,11 @@ export default {
     function play(level, topics) {
       stop();
 
+      const saved = Store.extra('simulator');
       const route = buildRoute(level, topics);
+      const scenery = buildScenery(route);
       const start = route.segments[0];
+      const audio = createAudio(saved.sound !== false);
 
       const car = {
         x: start.a.x + start.right.x * LANE_OFFSET,
@@ -229,23 +402,65 @@ export default {
         speed: 0,
       };
 
+      const cam = { x: car.x, y: car.y, zoom: BASE_ZOOM };
+      const skids = [];
+
       const input = { gas: false, brake: false, left: false, right: false };
       let signal = null;              // 'left' | 'right' | null
+      let signalTick = 0;
       let elapsed = 0;
       let nextJunction = 0;
       let finished = false;
+      let running = false;
 
       const faults = [];
       let minors = 0;
       let criticalFault = null;
 
-      // Timers for the "sustained" rules.
       let overSpeedFor = 0;
       let offRoadFor = 0;
       let wrongLaneFor = 0;
       let crawlFor = 0;
+      let skidTimer = 0;
 
       const others = topics.includes('traffic') ? spawnTraffic(route) : [];
+
+      /* ------------------------------------------------------- controls */
+      const CONTROLS = [
+        { role: 'signal', hold: null,    press: () => setSignal('left'),  glyph: '⬅', label: 'איתות שמאלה', key: 'Z', match: (k) => k === 'z' || k === 'Z' },
+        { role: 'steer',  hold: 'left',  glyph: '◀', label: 'היגוי שמאלה', key: '←', match: (k) => k === 'ArrowLeft' || k === 'a' || k === 'A' },
+        { role: 'gas',    hold: 'gas',   glyph: '▲', label: 'גז',          key: '↑', match: (k) => k === 'ArrowUp' || k === 'w' || k === 'W' },
+        { role: 'brake',  hold: 'brake', glyph: '▼', label: 'בלם',         key: '↓', match: (k) => k === 'ArrowDown' || k === 's' || k === 'S' },
+        { role: 'steer',  hold: 'right', glyph: '▶', label: 'היגוי ימינה', key: '→', match: (k) => k === 'ArrowRight' || k === 'd' || k === 'D' },
+        { role: 'signal', hold: null,    press: () => setSignal('right'), glyph: '➡', label: 'איתות ימינה', key: 'X', match: (k) => k === 'x' || k === 'X' },
+      ];
+
+      const controlBar = el('div', { class: 'control-bar' });
+      CONTROLS.forEach((c) => {
+        const btn = el('button', { class: 'ctrl', type: 'button', dataset: { role: c.role } },
+          el('span', { class: 'c-glyph', text: c.glyph }),
+          el('span', { class: 'c-label', text: c.label }),
+          el('span', { class: 'c-key', text: c.key }));
+
+        const down = (e) => {
+          e.preventDefault();
+          if (c.hold) { input[c.hold] = true; btn.classList.add('active'); }
+          else { c.press(); }
+        };
+        const up = (e) => {
+          e.preventDefault();
+          if (c.hold) { input[c.hold] = false; btn.classList.remove('active'); }
+        };
+        btn.addEventListener('pointerdown', down);
+        btn.addEventListener('pointerup', up);
+        btn.addEventListener('pointerleave', up);
+        btn.addEventListener('pointercancel', up);
+        c.btn = btn;
+        controlBar.append(btn);
+      });
+
+      const legend = el('div', { class: 'control-legend' },
+        CONTROLS.map((c) => el('div', {}, el('kbd', { text: c.key }), c.label)));
 
       /* ---------------------------------------------------------- layout */
       const canvas = el('canvas');
@@ -254,11 +469,13 @@ export default {
       const speedGauge = el('div', { class: 'gauge' }, el('b', { text: '0' }), el('span', { text: 'קמ״ש' }));
       const limitGauge = el('div', { class: 'gauge' }, el('b', { text: '50' }), el('span', { text: 'מותר' }));
       const instruction = el('div', { class: 'sim-instruction', text: 'צא/י לדרך' });
+
       const overlay = el('div', { class: 'canvas-overlay' },
         el('div', { class: 'stack center' },
-          el('h2', { text: 'מוכן/ה?' }),
-          el('p', { class: 'muted', text: 'הבוחן מתחיל למדוד ברגע שתלחצ/י.' }),
-          el('button', { class: 'btn btn-green btn-lg', text: 'התחל נסיעה', onClick: begin })));
+          el('h2', { text: 'מוכן/ה לנסיעה?' }),
+          el('p', { class: 'muted', text: 'הבוחן מתחיל למדוד ברגע שתלחצ/י. אפשר לנהוג במקלדת או בכפתורים שמתחת ללוח.' }),
+          legend,
+          el('button', { class: 'btn btn-green btn-lg', text: '🔑 התחל נסיעה', onClick: begin })));
 
       const wrap = el('div', { class: 'canvas-wrap' },
         canvas,
@@ -274,74 +491,59 @@ export default {
 
       const minorsLine = el('b', { text: `0 / ${level.allowance}` });
 
-      const touch = el('div', { class: 'touch-pad' },
-        touchBtn('Z', () => setSignal('left'), null, '◀'),
-        touchBtn('left', null, 'left', '⟲'),
-        touchBtn('gas', null, 'gas', '▲'),
-        touchBtn('brake', null, 'brake', '▼'),
-        touchBtn('right', null, 'right', '⟳'),
-        touchBtn('X', () => setSignal('right'), null, '▶'));
+      const soundBtn = el('button', {
+        class: 'btn btn-sm', type: 'button',
+        text: audio.enabled ? '🔊 קול' : '🔇 קול',
+        onClick: () => {
+          audio.setEnabled(!audio.enabled);
+          soundBtn.textContent = audio.enabled ? '🔊 קול' : '🔇 קול';
+          Store.setExtra('simulator', { ...Store.extra('simulator'), sound: audio.enabled });
+        },
+      });
 
       const panel = el('div', { class: 'card stack' },
         el('div', { class: 'spread' }, el('h3', { text: 'דוח הבוחן' }),
           el('span', { class: 'small muted' }, 'ליקויים: ', minorsLine)),
-        el('div', { class: 'spread' }, el('span', { class: 'small muted', text: 'איתות' }), signalLamps),
+        el('div', { class: 'spread' },
+          el('span', { class: 'small muted', text: 'איתות' }), signalLamps, soundBtn),
         el('div', { class: 'divider' }),
         faultLog);
 
       clear(root).append(el('div', { class: 'stack' },
-        el('div', { class: 'sim-layout' }, el('div', { class: 'stack' }, wrap, touch), panel),
+        el('div', { class: 'sim-layout' }, el('div', { class: 'stack' }, wrap, controlBar), panel),
         el('button', { class: 'btn btn-ghost', text: '← יציאה', onClick: () => { stop(); showSetup(); } }),
       ));
 
-      function touchBtn(id, onPress, holdKey, glyph) {
-        const b = el('button', { type: 'button', text: glyph });
-        const down = (e) => {
-          e.preventDefault();
-          b.classList.add('active');
-          if (holdKey) input[holdKey] = true;
-          if (onPress) onPress();
-        };
-        const up = (e) => {
-          e.preventDefault();
-          b.classList.remove('active');
-          if (holdKey) input[holdKey] = false;
-        };
-        b.addEventListener('pointerdown', down);
-        b.addEventListener('pointerup', up);
-        b.addEventListener('pointerleave', up);
-        b.addEventListener('pointercancel', up);
-        return b;
-      }
-
       /* ----------------------------------------------------------- input */
       function onKeyDown(e) {
-        switch (e.key) {
-          case 'ArrowUp': case 'w': case 'W': input.gas = true; break;
-          case 'ArrowDown': case 's': case 'S': input.brake = true; break;
-          case 'ArrowLeft': case 'a': case 'A': input.left = true; break;
-          case 'ArrowRight': case 'd': case 'D': input.right = true; break;
-          case 'z': case 'Z': setSignal('left'); return;
-          case 'x': case 'X': setSignal('right'); return;
-          default: return;
+        if (e.repeat) return;
+        for (const c of CONTROLS) {
+          if (!c.match(e.key)) continue;
+          e.preventDefault();
+          if (c.hold) { input[c.hold] = true; c.btn.classList.add('active'); }
+          else { c.press(); }
+          return;
         }
-        e.preventDefault();
       }
+
       function onKeyUp(e) {
-        switch (e.key) {
-          case 'ArrowUp': case 'w': case 'W': input.gas = false; break;
-          case 'ArrowDown': case 's': case 'S': input.brake = false; break;
-          case 'ArrowLeft': case 'a': case 'A': input.left = false; break;
-          case 'ArrowRight': case 'd': case 'D': input.right = false; break;
-          default: return;
+        for (const c of CONTROLS) {
+          if (!c.match(e.key) || !c.hold) continue;
+          e.preventDefault();
+          input[c.hold] = false;
+          c.btn.classList.remove('active');
+          return;
         }
-        e.preventDefault();
       }
 
       function setSignal(side) {
         signal = signal === side ? null : side;
+        signalTick = 0;
         signalLamps.children[0].classList.toggle('on', signal === 'left');
         signalLamps.children[1].classList.toggle('on', signal === 'right');
+        CONTROLS[0].btn.classList.toggle('active', signal === 'left');
+        CONTROLS[5].btn.classList.toggle('active', signal === 'right');
+        if (signal) audio.blip(1150, 0.05, 'square', 0.08);
       }
 
       /* --------------------------------------------------------- faults */
@@ -358,9 +560,11 @@ export default {
           el('span', {}, el('strong', { text: severity === 'critical' ? 'פסילה — ' : '' }), title)));
 
         if (severity === 'critical') {
+          audio.blip(150, 0.5, 'sawtooth', 0.2);
           criticalFault = entry;
           endRun(false);
         } else {
+          audio.blip(300, 0.18, 'triangle', 0.14);
           minors += 1;
           minorsLine.textContent = `${minors} / ${level.allowance}`;
           toast(`⚠️ ${title}`);
@@ -373,12 +577,10 @@ export default {
       }
 
       /* --------------------------------------------------------- physics */
-      let running = false;
-
       function begin() {
         overlay.style.display = 'none';
         running = true;
-        canvas.focus();
+        audio.start();
       }
 
       function step(dt) {
@@ -387,7 +589,6 @@ export default {
 
         elapsed += dt;
 
-        // Longitudinal.
         if (input.gas) car.speed += ACCEL * dt;
         else if (input.brake) car.speed -= BRAKE * dt;
         else car.speed -= DRAG * dt;
@@ -403,9 +604,41 @@ export default {
         car.x += Math.cos(car.heading) * car.speed * dt;
         car.y += Math.sin(car.heading) * car.speed * dt;
 
+        // Rubber on the road when braking hard.
+        skidTimer -= dt;
+        if (input.brake && car.speed > 85 && skidTimer <= 0) {
+          skidTimer = 0.035;
+          skids.push({ x: car.x, y: car.y, h: car.heading, life: 6 });
+          if (skids.length > 260) skids.shift();
+        }
+        for (let i = skids.length - 1; i >= 0; i--) {
+          skids[i].life -= dt;
+          if (skids[i].life <= 0) skids.splice(i, 1);
+        }
+
+        // Indicator ticks, so the signal is audible as well as visible.
+        if (signal) {
+          signalTick -= dt;
+          if (signalTick <= 0) { signalTick = 0.55; audio.blip(1150, 0.04, 'square', 0.06); }
+        }
+
+        audio.setSpeed(car.speed, input.gas);
+
+        updateCamera(dt);
         updateTraffic(dt);
         checkRules(dt);
         draw();
+      }
+
+      function updateCamera(dt) {
+        const lookahead = 100 + car.speed * 0.38;
+        const tx = car.x + Math.cos(car.heading) * lookahead;
+        const ty = car.y + Math.sin(car.heading) * lookahead;
+        const k = 1 - Math.pow(0.0015, dt);   // frame-rate independent smoothing
+        cam.x += (tx - cam.x) * k;
+        cam.y += (ty - cam.y) * k;
+        const targetZoom = BASE_ZOOM - Math.min(0.26, car.speed * 0.00098);
+        cam.zoom += (targetZoom - cam.zoom) * k;
       }
 
       /* ----------------------------------------------------------- rules */
@@ -435,9 +668,8 @@ export default {
         const { seg } = nearestSegment();
         speedGauge.firstChild.textContent = String(Math.round(kmh));
         limitGauge.firstChild.textContent = String(seg?.limit ?? 50);
-        speedGauge.classList.toggle('over', seg && kmh > seg.limit + level.speedGrace);
+        speedGauge.classList.toggle('over', Boolean(seg) && kmh > seg.limit + level.speedGrace);
 
-        // --- speed limit
         if (topics.includes('speed') && seg) {
           if (kmh > seg.limit + level.speedGrace) {
             overSpeedFor += dt;
@@ -454,7 +686,6 @@ export default {
           }
         }
 
-        // --- staying on the carriageway
         if (!onRoad()) {
           offRoadFor += dt;
           if (offRoadFor > level.offRoadGrace) {
@@ -466,7 +697,6 @@ export default {
           offRoadFor = 0;
         }
 
-        // --- lane discipline (skipped inside junction boxes, where crossing is normal)
         if (topics.includes('lanes') && seg && car.speed > 20 && !insideAnyJunction()) {
           const toCar = { x: car.x - seg.a.x, y: car.y - seg.a.y };
           const side = toCar.x * seg.right.x + toCar.y * seg.right.y;
@@ -485,7 +715,6 @@ export default {
           }
         }
 
-        // --- obstructing traffic
         if (!level.lenient && seg && kmh < 8 && onRoad() && !nearAnyStopRequirement()) {
           crawlFor += dt;
           if (crawlFor > 7) {
@@ -496,11 +725,9 @@ export default {
           crawlFor = 0;
         }
 
-        // --- junctions
         const junction = route.junctions[nextJunction];
         if (junction) handleJunction(junction, dt, kmh);
 
-        // --- collisions
         for (const other of others) {
           if (Math.hypot(other.x - car.x, other.y - car.y) < 34) {
             addFault('critical', 'תאונה — פגיעה ברכב אחר', 'מגע עם רכב אחר הוא כישלון מיידי במבחן.');
@@ -508,11 +735,8 @@ export default {
           }
         }
 
-        // --- finish line
         const last = route.nodes[route.nodes.length - 1];
-        if (Math.hypot(car.x - last.x, car.y - last.y) < 70) {
-          endRun(true);
-        }
+        if (Math.hypot(car.x - last.x, car.y - last.y) < 70) endRun(true);
       }
 
       function insideAnyJunction() {
@@ -540,7 +764,6 @@ export default {
       function handleJunction(j, dt, kmh) {
         const gap = distanceToStopLine(j);
 
-        // Pedestrian steps out when the player gets close.
         if (j.pedestrian && !j.pedestrian.done) {
           if (!j.pedestrian.active && gap < 240 && gap > 0) j.pedestrian.active = true;
           if (j.pedestrian.active) {
@@ -554,12 +777,11 @@ export default {
           j.minSpeedInZone = Math.min(j.minSpeedInZone, kmh);
         }
 
-        // Signalling has to be on before reaching the line, not after.
         if (topics.includes('signals') && j.turn !== 'straight' && !j.signalChecked && gap < 140 && gap > 20) {
           if (signal === j.turn) j.signalChecked = 'ok';
         }
 
-        if (gap > 0) return;          // not across the line yet
+        if (gap > 0) return;
         if (j.cleared) return;
         j.cleared = true;
 
@@ -596,12 +818,8 @@ export default {
             'יש לאותת בזמן, לפני תחילת הפנייה, כדי להודיע על הכוונה.');
         }
 
-        setSignalOffAfterTurn();
+        if (signal) setSignal(signal);   // cancel the indicator after the turn
         nextJunction += 1;
-      }
-
-      function setSignalOffAfterTurn() {
-        if (signal) setSignal(signal);
       }
 
       /* ------------------------------------------------------- other cars */
@@ -610,11 +828,14 @@ export default {
         rt.segments.forEach((seg, i) => {
           if (i === 0 || Math.random() > 0.7) return;
           const t = 0.35 + Math.random() * 0.4;
+          const baseSpeed = 70 + Math.random() * 50;
           cars.push({
             x: seg.a.x + (seg.b.x - seg.a.x) * t - seg.right.x * LANE_OFFSET,
             y: seg.a.y + (seg.b.y - seg.a.y) * t - seg.right.y * LANE_OFFSET,
             vx: -seg.dir.x, vy: -seg.dir.y,
-            speed: 70 + Math.random() * 50,
+            speed: baseSpeed,
+            baseSpeed,
+            braking: false,
             colour: pick(['#64748b', '#a855f7', '#0ea5e9', '#f97316']),
             seg,
           });
@@ -624,9 +845,24 @@ export default {
 
       function updateTraffic(dt) {
         for (const o of others) {
+          // Oncoming traffic obeys the same signals the player does.
+          let target = o.baseSpeed;
+          for (const j of route.junctions) {
+            const dx = j.centre.x - o.x;
+            const dy = j.centre.y - o.y;
+            const ahead = dx * o.vx + dy * o.vy;
+            const lateral = Math.abs(dx * -o.vy + dy * o.vx);
+            if (ahead <= 0 || ahead > 230 || lateral > HALF_ROAD) continue;
+            if (j.control === 'light' && lightState(j, elapsed) !== 'green') target = 0;
+            else if (j.control === 'stop' && ahead < 110) target = 0;
+            else if (j.control === 'yield' && ahead < 110) target = Math.min(target, 25);
+          }
+
+          o.braking = target < o.speed - 4;
+          o.speed += clamp(target - o.speed, -190 * dt, 95 * dt);
           o.x += o.vx * o.speed * dt;
           o.y += o.vy * o.speed * dt;
-          // Recycle a car once it has driven well past the start of its segment.
+
           const beyond = (o.x - o.seg.a.x) * o.seg.dir.x + (o.y - o.seg.a.y) * o.seg.dir.y;
           if (beyond < -260) {
             o.x = o.seg.b.x - o.seg.right.x * LANE_OFFSET;
@@ -641,28 +877,77 @@ export default {
         ctx.fillStyle = '#16281b';
         ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 
-        ctx.translate(VIEW_W / 2, VIEW_H / 2);
-        ctx.scale(ZOOM, ZOOM);
-        ctx.translate(-car.x - Math.cos(car.heading) * 90, -car.y - Math.sin(car.heading) * 90);
+        const shake = car.speed > 190 ? (car.speed - 190) * 0.012 : 0;
+        ctx.translate(VIEW_W / 2 + (Math.random() - 0.5) * shake, VIEW_H / 2 + (Math.random() - 0.5) * shake);
+        ctx.scale(cam.zoom, cam.zoom);
+        ctx.translate(-cam.x, -cam.y);
 
-        // Cross-street stubs, so junctions read as junctions.
-        ctx.fillStyle = '#2b3242';
+        drawBlocks();
+        drawRoads();
+        drawSkids();
+        drawJunctions();
+        drawFinish();
+        drawScenery();
+
+        for (const o of others) drawCar(o.x, o.y, Math.atan2(o.vy, o.vx), o.colour, false, o.braking);
+        drawCar(car.x, car.y, car.heading, '#22c55e', true, input.brake);
+
+        ctx.restore();
+        updateInstruction();
+      }
+
+      function drawBlocks() {
+        for (const b of scenery.buildings) {
+          ctx.fillStyle = 'rgba(0,0,0,.35)';
+          ctx.fillRect(b.x - b.w / 2 + 7, b.y - b.h / 2 + 9, b.w, b.h);
+          ctx.fillStyle = b.colour;
+          ctx.fillRect(b.x - b.w / 2, b.y - b.h / 2, b.w, b.h);
+          ctx.strokeStyle = 'rgba(148,163,184,.22)';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(b.x - b.w / 2, b.y - b.h / 2, b.w, b.h);
+          if (b.lit) {
+            ctx.fillStyle = 'rgba(253,224,71,.16)';
+            for (let wx = b.x - b.w / 2 + 12; wx < b.x + b.w / 2 - 14; wx += 26) {
+              for (let wy = b.y - b.h / 2 + 12; wy < b.y + b.h / 2 - 14; wy += 26) {
+                ctx.fillRect(wx, wy, 12, 12);
+              }
+            }
+          }
+        }
+      }
+
+      function drawRoads() {
+        // Pavement (kerb to kerb) sits under the asphalt so edges read cleanly.
+        ctx.fillStyle = '#4a5468';
+        for (const node of route.nodes) {
+          ctx.fillRect(node.x - HALF_ROAD - STUB - KERB, node.y - HALF_ROAD - KERB, ROAD_W + (STUB + KERB) * 2, ROAD_W + KERB * 2);
+          ctx.fillRect(node.x - HALF_ROAD - KERB, node.y - HALF_ROAD - STUB - KERB, ROAD_W + KERB * 2, ROAD_W + (STUB + KERB) * 2);
+        }
+        for (const seg of route.segments) {
+          ctx.fillRect(
+            Math.min(seg.a.x, seg.b.x) - HALF_ROAD - KERB,
+            Math.min(seg.a.y, seg.b.y) - HALF_ROAD - KERB,
+            Math.abs(seg.b.x - seg.a.x) + ROAD_W + KERB * 2,
+            Math.abs(seg.b.y - seg.a.y) + ROAD_W + KERB * 2,
+          );
+        }
+
+        ctx.fillStyle = '#2b3242';   // cross streets the route does not use
         for (const node of route.nodes) {
           ctx.fillRect(node.x - HALF_ROAD - STUB, node.y - HALF_ROAD, ROAD_W + STUB * 2, ROAD_W);
           ctx.fillRect(node.x - HALF_ROAD, node.y - HALF_ROAD - STUB, ROAD_W, ROAD_W + STUB * 2);
         }
 
-        // Route carriageway.
-        ctx.fillStyle = '#3a4152';
+        ctx.fillStyle = '#3a4152';   // the route itself
         for (const seg of route.segments) {
-          const x = Math.min(seg.a.x, seg.b.x) - HALF_ROAD;
-          const y = Math.min(seg.a.y, seg.b.y) - HALF_ROAD;
-          const w = Math.abs(seg.b.x - seg.a.x) + ROAD_W;
-          const h = Math.abs(seg.b.y - seg.a.y) + ROAD_W;
-          ctx.fillRect(x, y, w, h);
+          ctx.fillRect(
+            Math.min(seg.a.x, seg.b.x) - HALF_ROAD,
+            Math.min(seg.a.y, seg.b.y) - HALF_ROAD,
+            Math.abs(seg.b.x - seg.a.x) + ROAD_W,
+            Math.abs(seg.b.y - seg.a.y) + ROAD_W,
+          );
         }
 
-        // Centre lines.
         ctx.strokeStyle = 'rgba(248,250,252,.55)';
         ctx.lineWidth = 3;
         ctx.setLineDash([26, 22]);
@@ -673,14 +958,56 @@ export default {
           ctx.stroke();
         }
         ctx.setLineDash([]);
+      }
 
-        // Junction furniture.
+      function drawSkids() {
+        ctx.fillStyle = 'rgba(15,18,24,.5)';
+        for (const s of skids) {
+          ctx.save();
+          ctx.translate(s.x, s.y);
+          ctx.rotate(s.h);
+          ctx.globalAlpha = Math.min(1, s.life / 6) * 0.6;
+          ctx.fillRect(-6, -CAR_W / 2 + 2, 12, 4);
+          ctx.fillRect(-6, CAR_W / 2 - 6, 12, 4);
+          ctx.restore();
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      function drawScenery() {
+        for (const t of scenery.trees) {
+          ctx.fillStyle = 'rgba(0,0,0,.3)';
+          ctx.beginPath(); ctx.arc(t.x + 3, t.y + 4, t.r, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = '#166534';
+          ctx.beginPath(); ctx.arc(t.x, t.y, t.r, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = '#15803d';
+          ctx.beginPath(); ctx.arc(t.x - t.r * 0.25, t.y - t.r * 0.25, t.r * 0.6, 0, Math.PI * 2); ctx.fill();
+        }
+
+        for (const l of scenery.lamps) {
+          ctx.fillStyle = 'rgba(253,224,71,.08)';
+          ctx.beginPath(); ctx.arc(l.x, l.y, 46, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = '#cbd5e1';
+          ctx.beginPath(); ctx.arc(l.x, l.y, 4.5, 0, Math.PI * 2); ctx.fill();
+        }
+
+        for (const w of scenery.walkers) {
+          const t = Math.sin(elapsed * 0.55 + w.phase);
+          const x = w.ox + w.dir.x * t * w.span;
+          const y = w.oy + w.dir.y * t * w.span;
+          const bob = Math.sin(elapsed * 7 + w.phase) * 1.4;
+          ctx.fillStyle = w.colour;
+          ctx.beginPath(); ctx.arc(x, y - 7 + bob, 5, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.roundRect(x - 4, y - 1 + bob, 8, 12, 3); ctx.fill();
+        }
+      }
+
+      function drawJunctions() {
         route.junctions.forEach((j, i) => {
           const d = j.incoming.dir;
           const sx = j.centre.x - d.x * HALF_ROAD;
           const sy = j.centre.y - d.y * HALF_ROAD;
 
-          // stop line
           ctx.strokeStyle = '#f8fafc';
           ctx.lineWidth = 6;
           ctx.beginPath();
@@ -688,7 +1015,6 @@ export default {
           ctx.lineTo(sx, sy);
           ctx.stroke();
 
-          // zebra
           ctx.fillStyle = 'rgba(226,232,240,.85)';
           for (let k = 0; k < 5; k++) {
             const off = -HALF_ROAD + 6 + k * 10;
@@ -709,10 +1035,12 @@ export default {
             ctx.fillStyle = '#0b0f16';
             ctx.fillRect(signX - 9, signY - 26, 18, 52);
             const lamp = (dy, colour, on) => {
+              if (on) { ctx.shadowColor = colour; ctx.shadowBlur = 14; }
               ctx.fillStyle = on ? colour : '#1e293b';
               ctx.beginPath();
               ctx.arc(signX, signY + dy, 6, 0, Math.PI * 2);
               ctx.fill();
+              ctx.shadowBlur = 0;
             };
             lamp(-15, '#ef4444', state === 'red');
             lamp(0, '#f59e0b', state === 'amber');
@@ -740,7 +1068,6 @@ export default {
             ctx.stroke();
           }
 
-          // Speed-limit plate at the start of each leg.
           if (topics.includes('speed')) {
             const lx = j.centre.x + j.outgoing.dir.x * 130 + j.outgoing.right.x * (HALF_ROAD + 26);
             const ly = j.centre.y + j.outgoing.dir.y * 130 + j.outgoing.right.y * (HALF_ROAD + 26);
@@ -758,77 +1085,98 @@ export default {
             ctx.fillText(String(j.outgoing.limit), lx, ly);
           }
 
-          // Pedestrian on the crossing.
           if (j.pedestrian?.active) {
             const t = clamp(j.pedestrian.t, 0, 1.6) / 1.6;
             const px = sx - d.x * 26 + j.incoming.right.x * (HALF_ROAD - t * ROAD_W * 1.15);
             const py = sy - d.y * 26 + j.incoming.right.y * (HALF_ROAD - t * ROAD_W * 1.15);
+            const bob = Math.sin(elapsed * 8) * 1.5;
             ctx.fillStyle = '#fbbf24';
-            ctx.beginPath(); ctx.arc(px, py - 7, 6, 0, Math.PI * 2); ctx.fill();
-            ctx.beginPath(); ctx.roundRect(px - 5, py - 1, 10, 15, 4); ctx.fill();
+            ctx.beginPath(); ctx.arc(px, py - 7 + bob, 6, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.roundRect(px - 5, py - 1 + bob, 10, 15, 4); ctx.fill();
           }
 
-          // Guidance arrow on the junction the player is heading for.
+          // Turn guidance painted on the junction the player is heading for.
           if (i === nextJunction) {
             ctx.save();
-            ctx.globalAlpha = 0.55 + Math.sin(elapsed * 4) * 0.2;
+            ctx.globalAlpha = 0.35 + Math.sin(elapsed * 4) * 0.12;
             ctx.fillStyle = '#3b82f6';
             ctx.beginPath();
-            ctx.arc(j.centre.x, j.centre.y, 30, 0, Math.PI * 2);
+            ctx.arc(j.centre.x, j.centre.y, 34, 0, Math.PI * 2);
             ctx.fill();
+            ctx.restore();
+
+            const outAngle = Math.atan2(j.outgoing.dir.y, j.outgoing.dir.x);
+            ctx.save();
+            ctx.translate(j.centre.x, j.centre.y);
+            ctx.rotate(outAngle);
+            ctx.strokeStyle = '#dbeafe';
+            ctx.lineWidth = 6;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(-18, 0); ctx.lineTo(14, 0);
+            ctx.moveTo(4, -10); ctx.lineTo(16, 0); ctx.lineTo(4, 10);
+            ctx.stroke();
             ctx.restore();
           }
         });
-
-        // Finish marker.
-        const last = route.nodes[route.nodes.length - 1];
-        ctx.fillStyle = '#22c55e';
-        ctx.globalAlpha = 0.35;
-        ctx.beginPath();
-        ctx.arc(last.x, last.y, 46, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.globalAlpha = 1;
-        ctx.fillStyle = '#e8edf5';
-        ctx.font = 'bold 18px Rubik, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('סיום', last.x, last.y + 6);
-
-        // Other traffic.
-        for (const o of others) drawCar(o.x, o.y, Math.atan2(o.vy, o.vx), o.colour, false);
-
-        // Player.
-        drawCar(car.x, car.y, car.heading, '#22c55e', true);
-
-        ctx.restore();
-
-        updateInstruction();
       }
 
-      function drawCar(x, y, heading, colour, isPlayer) {
+      function drawFinish() {
+        const last = route.nodes[route.nodes.length - 1];
+        // Chequered pad rather than a flat disc, so the goal reads instantly.
+        for (let gx = -3; gx < 3; gx++) {
+          for (let gy = -3; gy < 3; gy++) {
+            ctx.fillStyle = (gx + gy) % 2 === 0 ? '#e2e8f0' : '#0b0f16';
+            ctx.fillRect(last.x + gx * 16, last.y + gy * 16, 16, 16);
+          }
+        }
+        ctx.fillStyle = '#22c55e';
+        ctx.font = 'bold 20px Rubik, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('סיום', last.x, last.y - 70);
+      }
+
+      function drawCar(x, y, heading, colour, isPlayer, braking) {
         ctx.save();
         ctx.translate(x, y);
         ctx.rotate(heading);
-        ctx.fillStyle = 'rgba(0,0,0,.4)';
-        ctx.beginPath(); ctx.roundRect(-CAR_L / 2 + 3, -CAR_W / 2 + 3, CAR_L, CAR_W, 6); ctx.fill();
+
+        ctx.fillStyle = 'rgba(0,0,0,.45)';
+        ctx.beginPath(); ctx.roundRect(-CAR_L / 2 + 3, -CAR_W / 2 + 4, CAR_L, CAR_W, 6); ctx.fill();
+
         ctx.fillStyle = colour;
         ctx.beginPath(); ctx.roundRect(-CAR_L / 2, -CAR_W / 2, CAR_L, CAR_W, 6); ctx.fill();
+
         ctx.fillStyle = 'rgba(203,213,225,.9)';
         ctx.beginPath(); ctx.roundRect(2, -CAR_W / 2 + 3, 12, CAR_W - 6, 3); ctx.fill();
+        ctx.fillStyle = 'rgba(203,213,225,.5)';
+        ctx.beginPath(); ctx.roundRect(-13, -CAR_W / 2 + 3, 8, CAR_W - 6, 3); ctx.fill();
 
-        if (isPlayer) {
-          ctx.fillStyle = '#fde68a';
-          ctx.fillRect(CAR_L / 2 - 3, -CAR_W / 2 + 2, 3, 5);
-          ctx.fillRect(CAR_L / 2 - 3, CAR_W / 2 - 7, 3, 5);
-          if (signal) {
-            const blink = Math.floor(elapsed * 3) % 2 === 0;
-            if (blink) {
-              ctx.fillStyle = '#f59e0b';
-              const sy = signal === 'left' ? -CAR_W / 2 : CAR_W / 2 - 5;
-              ctx.fillRect(-CAR_L / 2, sy, 8, 5);
-              ctx.fillRect(CAR_L / 2 - 8, sy, 8, 5);
-            }
-          }
+        // Headlights forward, brake lights aft.
+        ctx.fillStyle = '#fde68a';
+        ctx.fillRect(CAR_L / 2 - 3, -CAR_W / 2 + 2, 3, 5);
+        ctx.fillRect(CAR_L / 2 - 3, CAR_W / 2 - 7, 3, 5);
+
+        if (braking) {
+          ctx.shadowColor = '#ef4444';
+          ctx.shadowBlur = 12;
+          ctx.fillStyle = '#ef4444';
+          ctx.fillRect(-CAR_L / 2, -CAR_W / 2 + 2, 3, 5);
+          ctx.fillRect(-CAR_L / 2, CAR_W / 2 - 7, 3, 5);
+          ctx.shadowBlur = 0;
         }
+
+        if (isPlayer && signal && Math.floor(elapsed * 2.4) % 2 === 0) {
+          ctx.shadowColor = '#f59e0b';
+          ctx.shadowBlur = 10;
+          ctx.fillStyle = '#f59e0b';
+          const sy = signal === 'left' ? -CAR_W / 2 : CAR_W / 2 - 5;
+          ctx.fillRect(-CAR_L / 2 + 1, sy, 8, 5);
+          ctx.fillRect(CAR_L / 2 - 9, sy, 8, 5);
+          ctx.shadowBlur = 0;
+        }
+
         ctx.restore();
       }
 
@@ -837,14 +1185,16 @@ export default {
         if (!j) {
           const last = route.nodes[route.nodes.length - 1];
           const d = Math.round(Math.hypot(car.x - last.x, car.y - last.y) / 10);
-          instruction.textContent = `סיום המסלול · ${d} מ׳`;
+          instruction.textContent = `🏁 סיום המסלול · ${d} מ׳`;
           return;
         }
         const metres = Math.max(0, Math.round(distanceToStopLine(j) / 10));
-        const control = j.control === 'light' ? ' · רמזור'
-          : j.control === 'stop' ? ' · תמרור עצור'
+        const arrow = j.turn === 'left' ? '↰' : j.turn === 'right' ? '↱' : '↑';
+        const control = j.control === 'light'
+          ? ` · רמזור ${{ red: '🔴', amber: '🟡', green: '🟢' }[lightState(j, elapsed)]}`
+          : j.control === 'stop' ? ' · 🛑 עצור'
           : j.control === 'yield' ? ' · תן זכות קדימה' : '';
-        instruction.textContent = `${TURN_TEXT[j.turn]} בעוד ${metres} מ׳${control}`;
+        instruction.textContent = `${arrow} ${TURN_TEXT[j.turn]} בעוד ${metres} מ׳${control}`;
       }
 
       /* ------------------------------------------------------------- end */
@@ -901,6 +1251,7 @@ export default {
 
       stop = () => {
         cancel();
+        audio.close();
         document.removeEventListener('keydown', onKeyDown);
         document.removeEventListener('keyup', onKeyUp);
       };
